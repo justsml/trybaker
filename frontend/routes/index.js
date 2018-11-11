@@ -1,76 +1,42 @@
 const { body,validationResult } = require('express-validator/check');
 const { sanitizeBody } = require('express-validator/filter');
-var express = require('express');
-var rp = require('request-promise');
-var router = express.Router();
-
-const sendCode = (phone) => {
-    "use strict";
-    return rp(`http://loyalty-api:3000/api/verify/phone/${phone}?code=new`)
-        .then(result => {
-            return result;
-        }).catch(err => {
-            console.log(err)
-            return false;
-        })
-};
-
-const completeVerification = (code,phone,fName,lName,email) => {
-    "use strict";
-    return rp(`http://loyalty-api:3000/api/verify/phone/${phone}?code=${code}&e=${email}&f=${fName}&l=${lName}`)
-        .then(results => JSON.parse(results))
-        .then(results => {
-            if (results.status != 'valid' || !results.userId) {
-                throw new Error('invalid session')
-            }
-            return results;
-        })
-};
-
-const getData = (code,phone,fName,lName,email) => {
-    "use strict";
-    return rp(`http://loyalty-api:3000/api/verify/phone/${phone}?code=${code}&e=${email}&f=${fName}&l=${lName}`)
-        .then(results => JSON.parse(results))
-        .then(results => {
-            return results;
-        })
-};
-
+const express = require('express');
+const router = express.Router();
+const phoneAPI = require('../api/phone');
+const querystring = require('querystring');
 
 /* GET home page. */
 router.get('/', function(req, res) {
   res.render('index', { title: 'Welcome to TryBaker!' });
 });
 
-router.get('/challenge', function(req, res) {
-    const {phone, f,l,e, userId}  = req.query;
+router.get('/challenge', function(req, res, next) {
+    const {phone, fName, lName, email, userId}  = req.query;
 
     res.render('challenge', {
         title: userId ? 'Welcome back,' : 'Lets get you verified:',
         phone,
-        fName: f,
-        lName: l,
-        email: e,
+        fName,
+        lName,
+        email,
         doesUserExist: !userId,
     });
 });
 
-router.get('/dashboard', function(req, res) {
+router.get('/dashboard', function(req, res, next) {
     // using a timeout to defeat a small race condition on the api
     setTimeout(() => {
-        const {code, phone, f,l,e}  = req.query;
-
-        getData(code,phone,f,l,e)
+        phoneAPI.getData(req.query)
             .then(results => {
                 if(results.status == 'invalid') {
                     let userId;
                     if(results.user) {
                         userId = results.user.id;
                     }
-                    return res.redirect(`/challenge?phone=${phone}&userId=${userId}&errors=['Expired Session']&code=${code}&f=${f}&l=${l}&e=${e}`);
+                    return res.redirect(`/challenge?${querystring.stringify({userId: userId, ...req.query})}`);
                 }
 
-                console.log('dashboard hydration? ', {results,code,phone,f,l,e})
+                // console.log('dashboard hydration? ', {results, ...req.query})
                 const user = results.user;
                 const data = results.data;
                 res.render('dashboard', {
@@ -78,73 +44,62 @@ router.get('/dashboard', function(req, res) {
                     total: data.total,
                     visits: data.entries.length,
                     entries: data.entries,
-                    phone: phone,
-                    firstName: user.firstName,
-                    lastName: user.lastName,
-                    email: user.emailAddress,
-                    userId: user.id,
+                    ...req.query
                 });
             })
-    }, 1000)
-
-
+            .catch(next);
+    }, 100)
 });
 
 
 // Form submission logic
 // #1 Login given a phone number
-router.post('/login', function(req,res,next) {
+router.post('/login', function(req, res, next) {
     console.log('login post', req.body);
-    if(!req.body.phone) {return res.redirect('/')}
+    if(!req.body.phone) { return res.redirect(`/?errors=['Invalid request. No code or phone.']`) }
 
-    sendCode(req.body.phone).then(result => {
-        "use strict";
-        console.log('+++++++++++++++++++++++++++++++')
-        console.log('result', result)
-        console.log('+++++++++++++++++++++++++++++++')
-        if(result){
-            let userId = result.userId  || '';
-            res.redirect(`/challenge?phone=${req.body.phone}&userId=${userId}`);
-        }
-
-        else
-            res.redirect('/');
-    })
+    phoneAPI.sendCode(req.body.phone)
+        .then(result => {
+            console.log('+++++++++++++++++++++++++++++++')
+            console.log('result', result)
+            console.log('+++++++++++++++++++++++++++++++')
+            if(result){
+                let userId = result.userId  || '';
+                res.redirect(`/challenge?phone=${req.body.phone}&userId=${userId}`);
+            } else {
+                res.redirect('/');
+            }
+        })
+        .catch(next)
 });
 
 // #2  Let's verify that you own that phone number given a phone number and code
-router.post('/verification', function(req,res) {
-    const {code, phone, fName,lName,email}  = req.body;
-    if(!code || !phone)
-        res.redirect('/');
-    else {
-        completeVerification(code,phone,fName,lName,email)
+router.post('/verification', function(req, res, next) {
+    const {code, phone}  = req.body;
+
+    if(!code || !phone) {
+        res.redirect(`/?errors=['Invalid request. No code or phone.']`);
+    } else {
+        phoneAPI.completeVerification(req.body)
             .then(result => {
-                const {code, phone, fName,lName,email}  = req.body;
                 const {userId} = result;
                 if(userId) {
-                    res.redirect(`/checkin?phone=${phone}&code=${code}&f=${fName}&l=${lName}&e=${email}`)
+                    res.redirect(`/checkin?${querystring.stringify({...req.body, userId: userId})}`);
                 } else {
-                    res.redirect(`/challenge?phone=${phone}&errors=['Invalid code used']&code=${code}&f=${fName}&l=${lName}&e=${email}`);
+                    res.redirect(`/challenge?errors=['Invalid code used']&${querystring.stringify(req.body)}`);
                 }
-
-            }).catch(err => {
-                console.log(err)
-                res.redirect(`/challenge?phone=${phone}&errors=['Something went wrong']&code=${code}&f=${fName}&l=${lName}&e=${email}`);
-        })
-
+            })
+            .catch(err => {
+                console.log(err);
+                res.redirect(`/challenge?errors=['Something went wrong']&${querystring.stringify(req.body)}`);
+            });
     }
-
 });
 
 // #3 Lets get you hydrated, you seem to belong
-router.get('/checkin', function(req,res) {
-    console.log(req.query)
-    const {code, phone, f,l,e}  = req.query;
-
-    console.log('dashboard hydration');
-
-    res.redirect(`/dashboard?phone=${phone}&code=${code}&f=${f}&l=${l}&e=${e}`)
+router.get('/checkin', function(req, res) {
+    console.log('dashboard hydration', req.query);
+    res.redirect(`/dashboard?${querystring.stringify(req.query)}`);
 });
 
 
